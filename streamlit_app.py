@@ -14,7 +14,7 @@ st.set_page_config(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "genetic_disorder_model.pkl"
+MODEL_PATH = BASE_DIR / "trained_pipeline.pkl"
 
 st.title("🧬 Genetic Disorder Risk Classification System")
 st.write("Logistic Regression | Patient Attribute Analysis")
