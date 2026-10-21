@@ -4,6 +4,10 @@ import pandas as pd
 import joblib
 from pathlib import Path
 
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
 # --------------------------------------------------
 # PAGE CONFIGURATION
 # --------------------------------------------------
@@ -31,7 +35,7 @@ st.warning(
 )
 
 # --------------------------------------------------
-# LOAD MODEL
+# LOAD MODEL FILES
 # --------------------------------------------------
 
 @st.cache_resource
@@ -56,54 +60,113 @@ except Exception as e:
     st.stop()
 
 # --------------------------------------------------
-# READ PREPROCESSOR
+# FIND PIPELINE AND PREPROCESSOR
 # --------------------------------------------------
 
-try:
-    preprocessor = model.named_steps["preprocessor"]
+def find_pipeline(obj):
+    if isinstance(obj, Pipeline):
+        return obj
 
-    numeric_cols = []
-    categorical_cols = []
+    if isinstance(obj, dict):
+        for value in obj.values():
+            result = find_pipeline(value)
+            if result is not None:
+                return result
 
-    for name, transformer, columns in preprocessor.transformers_:
+    return None
 
-        if hasattr(columns, "tolist"):
-            columns = columns.tolist()
-        elif isinstance(columns, str):
-            columns = [columns]
+
+def find_column_transformer(obj):
+    if isinstance(obj, ColumnTransformer):
+        return obj
+
+    if isinstance(obj, Pipeline):
+        for _, step in obj.steps:
+            result = find_column_transformer(step)
+            if result is not None:
+                return result
+
+    if isinstance(obj, dict):
+        for value in obj.values():
+            result = find_column_transformer(value)
+            if result is not None:
+                return result
+
+    return None
+
+
+pipeline = find_pipeline(model)
+preprocessor = find_column_transformer(model)
+
+# --------------------------------------------------
+# DETERMINE INPUT FEATURES
+# --------------------------------------------------
+
+numeric_cols = []
+categorical_cols = []
+
+if preprocessor is not None:
+
+    try:
+        for name, transformer, columns in preprocessor.transformers_:
+
+            if isinstance(columns, str):
+                columns = [columns]
+            elif hasattr(columns, "tolist"):
+                columns = columns.tolist()
+            else:
+                columns = list(columns)
+
+            if name == "num":
+                numeric_cols.extend(columns)
+
+            elif name == "cat":
+                categorical_cols.extend(columns)
+
+        if hasattr(preprocessor, "feature_names_in_"):
+            model_features = list(preprocessor.feature_names_in_)
         else:
-            columns = list(columns)
+            model_features = list(dict.fromkeys(
+                numeric_cols + categorical_cols
+            ))
 
-        if name == "num":
-            numeric_cols.extend(columns)
-
-        elif name == "cat":
-            categorical_cols.extend(columns)
-
-    # Use the model's actual expected input columns
-    model_features = list(
-        preprocessor.feature_names_in_
-    )
-
-    missing_features = [
-        col for col in model_features
-        if col not in feature_columns
-    ]
-
-    if missing_features:
-        st.error(
-            "feature_columns.pkl does not contain all model input columns. "
-            "Please update feature_columns.pkl using the training notebook."
-        )
-        st.write("Missing columns:", missing_features)
+    except Exception as e:
+        st.error(f"Could not inspect preprocessing columns: {e}")
         st.stop()
 
-except Exception as e:
-    st.error(f"Could not read preprocessing columns: {e}")
+else:
+    st.error(
+        "No ColumnTransformer was found in the loaded model. "
+        "Check that genetic_disorder_model.pkl is the original "
+        "trained Pipeline file."
+    )
+
+    st.write("Loaded object type:", str(type(model)))
+
+    if isinstance(model, dict):
+        st.write("Available dictionary keys:", list(model.keys()))
+
+    st.stop()
+
+if not model_features:
+    st.error("No input features were found in the model.")
+    st.stop()
+
+missing_features = [
+    col for col in model_features
+    if col not in feature_columns
+]
+
+if missing_features:
+    st.error(
+        "feature_columns.pkl is missing model input columns. "
+        "Please regenerate it from the training notebook."
+    )
+    st.write("Missing columns:", missing_features)
     st.stop()
 
 # --------------------------------------------------
-# SIDEBAR
+# NAVIGATION
 # --------------------------------------------------
 
 page = st.sidebar.radio(
@@ -118,7 +181,6 @@ page = st.sidebar.radio(
 if page == "Patient Prediction":
 
     st.header("Enter Patient Attributes")
-
     st.caption(
         "Enter values matching the original training dataset."
     )
@@ -135,7 +197,6 @@ if page == "Patient Prediction":
             with container:
 
                 if feature in numeric_cols:
-
                     patient_data[feature] = st.number_input(
                         str(feature),
                         value=0.0,
@@ -143,7 +204,6 @@ if page == "Patient Prediction":
                     )
 
                 elif feature in categorical_cols:
-
                     patient_data[feature] = st.text_input(
                         str(feature),
                         value="",
@@ -151,9 +211,7 @@ if page == "Patient Prediction":
                     )
 
                 else:
-                    st.warning(
-                        f"Unknown feature type: {feature}"
-                    )
+                    st.error(f"Unknown input feature: {feature}")
 
         submitted = st.form_submit_button(
             "Predict Genetic Disorder",
@@ -182,13 +240,19 @@ if page == "Patient Prediction":
 
             if hasattr(model, "predict_proba"):
 
-                probabilities = model.predict_proba(
-                    patient_df
-                )[0]
+                probabilities = model.predict_proba(patient_df)[0]
 
-                classifier = model.named_steps["classifier"]
+                classifier = None
 
-                classes = classifier.classes_
+                if pipeline is not None:
+                    classifier = pipeline.named_steps.get("classifier")
+
+                classes = (
+                    classifier.classes_
+                    if classifier is not None
+                    and hasattr(classifier, "classes_")
+                    else list(range(len(probabilities)))
+                )
 
                 probability_df = pd.DataFrame({
                     "Disorder Category": classes,
@@ -206,9 +270,9 @@ if page == "Patient Prediction":
                 st.subheader("Prediction Probability by Category")
 
                 st.bar_chart(
-                    probability_df.set_index(
-                        "Disorder Category"
-                    )["Probability"]
+                    probability_df.set_index("Disorder Category")[
+                        "Probability"
+                    ]
                 )
 
                 with st.expander("View probability details"):
@@ -227,9 +291,8 @@ if page == "Patient Prediction":
 elif page == "Model Information":
 
     st.header("Model Information")
-
     st.write("**Algorithm:** Logistic Regression")
-    st.write("**Preprocessing:** Imputation, scaling, and encoding")
+    st.write("**Preprocessing:** Imputation, scaling and encoding")
     st.write("**Prediction target:** Genetic Disorder category")
 
     st.subheader("Model Input Features")
@@ -245,10 +308,16 @@ elif page == "Model Information":
         use_container_width=True
     )
 
+    st.subheader("Model Structure")
+
+    st.write("Loaded object:", str(type(model)))
+
+    if pipeline is not None:
+        st.write("Pipeline steps:", list(pipeline.named_steps.keys()))
+
     st.subheader("Model Performance")
 
     st.info(
-        "Actual test-set metrics must be loaded from the model "
-        "evaluation results. No accuracy or performance values "
-        "are assumed here."
+        "Actual test-set performance metrics must be loaded from "
+        "the evaluation results. No accuracy values are assumed."
     )
