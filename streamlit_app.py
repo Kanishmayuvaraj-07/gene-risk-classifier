@@ -2,11 +2,7 @@
 import streamlit as st
 import pandas as pd
 import joblib
-
 from pathlib import Path
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 # --------------------------------------------------
 # PAGE CONFIGURATION
@@ -23,6 +19,10 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "genetic_disorder_model.pkl"
 FEATURE_PATH = BASE_DIR / "feature_columns.pkl"
 
+# --------------------------------------------------
+# HEADER
+# --------------------------------------------------
+
 st.title("🧬 Genetic Disorder Risk Classification System")
 st.write("Logistic Regression | Patient Attribute Analysis")
 
@@ -32,7 +32,7 @@ st.warning(
 )
 
 # --------------------------------------------------
-# LOAD MODEL FILES
+# LOAD MODEL
 # --------------------------------------------------
 
 @st.cache_resource
@@ -40,54 +40,41 @@ def load_model():
     return joblib.load(MODEL_PATH)
 
 @st.cache_data
-def load_columns():
+def load_feature_columns():
     return joblib.load(FEATURE_PATH)
 
 try:
     model = load_model()
-    feature_columns = load_columns()
+    feature_columns = load_feature_columns()
 
-    # Convert feature names into a regular Python list
     if hasattr(feature_columns, "tolist"):
         feature_columns = feature_columns.tolist()
     else:
         feature_columns = list(feature_columns)
 
 except Exception as e:
-    st.error(f"Model files could not be loaded: {e}")
+    st.error(f"Could not load model files: {e}")
     st.info(
-        "Check that genetic_disorder_model.pkl and "
-        "feature_columns.pkl exist in the repository root."
+        "Ensure genetic_disorder_model.pkl and "
+        "feature_columns.pkl are in the same folder as streamlit_app.py."
     )
     st.stop()
 
 # --------------------------------------------------
-# FIND PREPROCESSOR
+# GET PREPROCESSOR COLUMNS
 # --------------------------------------------------
 
-def find_preprocessor(obj):
-    if isinstance(obj, ColumnTransformer):
-        return obj
+try:
+    preprocessor = model.named_steps["preprocessor"]
 
-    if isinstance(obj, Pipeline):
-        for _, step in obj.steps:
-            result = find_preprocessor(step)
-            if result is not None:
-                return result
-
-    return None
-
-
-def get_input_columns(model):
     numeric_cols = []
     categorical_cols = []
 
-    preprocessor = find_preprocessor(model)
-
-    if preprocessor is None:
-        return None, None
-
     for name, transformer, columns in preprocessor.transformers_:
+
+        if name == "remainder":
+            continue
+
         if isinstance(columns, str):
             columns = [columns]
         elif hasattr(columns, "tolist"):
@@ -95,36 +82,38 @@ def get_input_columns(model):
         else:
             columns = list(columns)
 
-        if transformer == "drop":
-            continue
-
-        if transformer == "passthrough":
-            categorical_cols.extend(columns)
-            continue
-
-        steps = (
-            list(transformer.named_steps.values())
-            if isinstance(transformer, Pipeline)
-            else [transformer]
-        )
-
-        if any(isinstance(s, OneHotEncoder) for s in steps):
-            categorical_cols.extend(columns)
-
-        elif any(isinstance(s, StandardScaler) for s in steps):
+        if name == "num":
             numeric_cols.extend(columns)
 
-        else:
-            # Do not guess unknown column types.
-            return None, None
+        elif name == "cat":
+            categorical_cols.extend(columns)
 
-    return numeric_cols, categorical_cols
+    if not numeric_cols and not categorical_cols:
+        st.error("Could not identify numeric and categorical input columns.")
+        st.stop()
 
-
-numeric_cols, categorical_cols = get_input_columns(model)
+except Exception as e:
+    st.error(f"Could not read preprocessing columns: {e}")
+    st.stop()
 
 # --------------------------------------------------
-# SIDEBAR NAVIGATION
+# VALIDATE FEATURES
+# --------------------------------------------------
+
+unknown_features = [
+    col for col in feature_columns
+    if col not in numeric_cols and col not in categorical_cols
+]
+
+if unknown_features:
+    st.error(
+        "Some features in feature_columns.pkl do not match the model's "
+        f"preprocessor: {unknown_features}"
+    )
+    st.stop()
+
+# --------------------------------------------------
+# NAVIGATION
 # --------------------------------------------------
 
 page = st.sidebar.radio(
@@ -140,27 +129,8 @@ if page == "Patient Prediction":
 
     st.header("Enter Patient Attributes")
     st.caption(
-        "Enter values matching the original training dataset columns."
+        "Enter values matching the columns used during model training."
     )
-
-    if numeric_cols is None:
-        st.error(
-            "The model's preprocessing structure could not be identified. "
-            "Please check the training Pipeline before entering predictions."
-        )
-        st.stop()
-
-    missing_features = [
-        col for col in feature_columns
-        if col not in numeric_cols and col not in categorical_cols
-    ]
-
-    if missing_features:
-        st.error(
-            "Some input features do not match the model's preprocessing "
-            f"configuration: {missing_features}"
-        )
-        st.stop()
 
     with st.form("patient_form"):
 
@@ -176,16 +146,16 @@ if page == "Patient Prediction":
 
                 if feature in numeric_cols:
                     patient_data[feature] = st.number_input(
-                        label=str(feature),
+                        str(feature),
                         value=0.0,
-                        key=f"num_{feature}"
+                        key=f"numeric_{feature}"
                     )
 
                 elif feature in categorical_cols:
                     patient_data[feature] = st.text_input(
-                        label=str(feature),
+                        str(feature),
                         value="",
-                        key=f"cat_{feature}"
+                        key=f"categorical_{feature}"
                     )
 
         submitted = st.form_submit_button(
@@ -200,6 +170,14 @@ if page == "Patient Prediction":
             columns=feature_columns
         )
 
+        # Ensure numeric values are numeric
+        for feature in numeric_cols:
+            if feature in patient_df.columns:
+                patient_df[feature] = pd.to_numeric(
+                    patient_df[feature],
+                    errors="coerce"
+                )
+
         try:
             prediction = model.predict(patient_df)[0]
 
@@ -211,13 +189,18 @@ if page == "Patient Prediction":
 
                 probabilities = model.predict_proba(patient_df)[0]
 
-                classes = getattr(
-                    model,
-                    "classes_",
-                    list(range(len(probabilities)))
+                classifier = model.named_steps.get(
+                    "classifier",
+                    model
                 )
 
-                prob_df = pd.DataFrame({
+                classes = getattr(
+                    classifier,
+                    "classes_",
+                    range(len(probabilities))
+                )
+
+                probability_df = pd.DataFrame({
                     "Disorder Category": classes,
                     "Probability": probabilities
                 }).sort_values(
@@ -227,18 +210,20 @@ if page == "Patient Prediction":
 
                 st.metric(
                     "Highest Model Probability",
-                    f"{probabilities.max():.2%}"
+                    f"{max(probabilities):.2%}"
                 )
 
                 st.subheader("Prediction Probability by Category")
 
                 st.bar_chart(
-                    prob_df.set_index("Disorder Category")["Probability"]
+                    probability_df.set_index("Disorder Category")[
+                        "Probability"
+                    ]
                 )
 
                 with st.expander("View probability details"):
                     st.dataframe(
-                        prob_df,
+                        probability_df,
                         use_container_width=True
                     )
 
@@ -254,10 +239,7 @@ elif page == "Model Information":
     st.header("Model Information")
 
     st.write("**Algorithm:** Logistic Regression")
-    st.write(
-        "**Preprocessing:** Uses the preprocessing steps "
-        "saved inside the trained model, when available."
-    )
+    st.write("**Preprocessing:** Numeric and categorical transformers")
     st.write("**Prediction target:** Genetic Disorder category")
 
     st.subheader("Input Features")
@@ -267,14 +249,17 @@ elif page == "Model Information":
         use_container_width=True
     )
 
+    st.subheader("Model Structure")
+
+    st.write("Pipeline steps:")
+
+    if hasattr(model, "named_steps"):
+        st.write(list(model.named_steps.keys()))
+
     st.subheader("Model Performance")
 
     st.info(
-        "Display measured test accuracy, precision, recall, F1-score, "
-        "and confusion matrix here after loading the actual evaluation "
-        "results from training."
+        "Actual test accuracy, precision, recall, F1-score, and confusion "
+        "matrix must be loaded from the model's evaluation results. "
+        "No performance values are assumed here."
     )
-
-    if hasattr(model, "classes_"):
-        st.subheader("Supported Prediction Categories")
-        st.write([str(c) for c in model.classes_])
